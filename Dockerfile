@@ -12,6 +12,7 @@ RUN pip install -r requirements.txt
 
 COPY app /app/app
 COPY scripts /app/scripts
+COPY examples /app/examples
 
 EXPOSE 8000
 

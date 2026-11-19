@@ -22,10 +22,14 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def run_lineage_query(sql: str) -> dict[str, Any]:
+def run_lineage_query(
+    sql: str, snapshot_id: str | None = None
+) -> dict[str, Any]:
     """完整执行一条受管 SELECT，返回原结果与逐行溯源。
 
     流程全部处于同一快照事务内：任何阶段失败都回滚，不返回部分依据。
+    ``snapshot_id`` 为空时取当前已提交数据；否则读取批次更正归档的历史
+    快照（更正前/更正后），用于追溯当时的完整来源。
     """
     # 1) 白名单校验（事务前先拦截非法 SQL）
     try:
@@ -35,8 +39,12 @@ def run_lineage_query(sql: str) -> dict[str, Any]:
     except Exception as exc:
         raise UnsupportedSQLError(f"SQL 无法解析：{exc}") from exc
 
-    # 2) 固定快照事务
-    with db.snapshot_transaction() as (conn, snapshot_id, snapshot_map):
+    # 2) 固定快照事务（当前数据或历史归档快照）
+    with db.snapshot_transaction(snapshot_id) as (
+        conn,
+        result_snapshot_id,
+        snapshot_map,
+    ):
         # 3) 生成携带 __prov__ 的溯源 SQL
         lineage_ast = rewrite(validated, snapshot_map)
         lineage_sql = render_sql(lineage_ast)
@@ -85,10 +93,71 @@ def run_lineage_query(sql: str) -> dict[str, Any]:
         )
 
     return {
-        "snapshot_id": snapshot_id,
+        "snapshot_id": result_snapshot_id,
         "submitted_sql": sql,
         "columns": result_columns,
         "rows": result_rows,
         "lineage": lineage_rows,
         "row_count": len(result_rows),
     }
+
+
+def _summary(stat: dict[str, Any], threshold: float | int) -> dict[str, Any]:
+    return {
+        "sample_count": stat["sample_count"],
+        "non_null_value_sum": stat["non_null_value_sum"],
+        "exceeds_threshold": stat["non_null_value_sum"] > threshold,
+    }
+
+
+def correct_batch(
+    sample_id: int,
+    expected_batch: str,
+    new_batch: str,
+    threshold: float | int,
+) -> dict[str, Any]:
+    """更正样本批次，返回原批次与新批次在更正前后是否超阈的结论。
+
+    ``db.correct_sample_batch`` 在同一事务内完成校验、前后快照统计、并发
+    检测与提交；本函数只把统计结果与阈值比较并组织响应。若原批次与新
+    批次同名，两个条目的统计相同。
+    """
+    outcome = db.correct_sample_batch(
+        sample_id=sample_id,
+        expected_batch=expected_batch,
+        new_batch=new_batch,
+    )
+    batches: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for batch, role in (
+        (outcome["expected_batch"], "old"),
+        (outcome["new_batch"], "new"),
+    ):
+        if batch in seen:
+            continue
+        seen.add(batch)
+        batches.append(
+            {
+                "batch": batch,
+                "role": role,
+                "before": _summary(outcome["before"][batch], threshold),
+                "after": _summary(outcome["after"][batch], threshold),
+                "before_snapshot_id": outcome["before_snapshot_id"],
+                "after_snapshot_id": outcome["after_snapshot_id"],
+            }
+        )
+    return {
+        "sample_id": outcome["sample_id"],
+        "expected_batch": outcome["expected_batch"],
+        "new_batch": outcome["new_batch"],
+        "threshold": threshold,
+        "applied": True,
+        "batches": batches,
+    }
+
+
+__all__ = [
+    "QueryFailure",
+    "correct_batch",
+    "run_lineage_query",
+]

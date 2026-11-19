@@ -17,11 +17,13 @@
 docker compose up --build
 ```
 
-启动时 api 容器会自动幂等建表并写入预置演示数据（7 样本、8 检测）。
-如需手动重新播种：
+启动时 api 容器会自动幂等建表并写入预置演示数据（7 样本、8 检测）；
+若 `samples` 已有数据则跳过播种，容器重启不会覆盖已提交的批次更正。
+如需手动重新播种（`--reset` 会连同批次修订号与归档快照一起清空）：
 
 ```bash
 docker compose exec api python -m scripts.seed_db
+docker compose exec api python -m scripts.seed_db --reset
 ```
 
 - API 与 Swagger 文档：<http://localhost:8000/docs>
@@ -65,11 +67,16 @@ docker compose exec api python -m scripts.seed_db
 溯源状态用 PostgreSQL jsonb 在 SQL 内随查询传播，配合两个会话级临时聚合
 （状态聚合 `prov_agg_state` 与最终聚合 `prov_agg`）实现嵌套 CTE 的二次汇总。
 
+6. **历史快照归档**：批次更正会在同一事务内把更正前、更正后两份完整表内容
+   写入 `snapshot_archive`（`/query?snapshot_id=…` 时加载为查询临时表），
+   因此更正后的任意查询都能复现「更正前」或「更正后」当时的完整来源。
+
 ## 四、HTTP 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/query` | 提交受管 SELECT，返回结果与逐行溯源 |
+| POST | `/query` | 提交受管 SELECT，返回结果与逐行溯源；可带 `snapshot_id` 追溯历史快照 |
+| POST | `/batch-corrections` | 更正样本批次，返回受影响批次更正前后的异常汇总 |
 | PUT | `/samples` | 新增/修改样本 `{id, batch}` |
 | DELETE | `/samples/{id}` | 删除样本（连带其检测行） |
 | PUT | `/results` | 新增/修改检测 `{id, sample_id, value}`（value 可空） |
@@ -101,6 +108,84 @@ docker compose exec api python -m scripts.seed_db
 
 更多带数据的例子见 [`examples/queries.md`](examples/queries.md)。
 
+### 4.1 批次更正 `POST /batch-corrections`
+
+检验员更正样本批次时，需要先知道「异常汇总会怎样变化」。请求：
+
+```json
+{
+  "sample_id": 1,
+  "expected_batch": "A",
+  "new_batch": "B",
+  "threshold": 10
+}
+```
+
+`expected_batch` 是调用方期望的旧批次（乐观锁）；`threshold` 为异常阈值，
+**非空检测值总和 > 阈值** 记为超阈。
+
+响应同时给出**原批次**（`role: "old"`）与**新批次**（`role: "new"`）在
+**更正前快照**与**成功提交后**的样本数、非空检测值总和、是否超阈，并附两份
+可追溯快照 ID：
+
+```json
+{
+  "sample_id": 1,
+  "expected_batch": "A",
+  "new_batch": "B",
+  "threshold": 10,
+  "applied": true,
+  "batches": [
+    {"batch": "A", "role": "old",
+     "before": {"sample_count": 2, "non_null_value_sum": 21, "exceeds_threshold": true},
+     "after":  {"sample_count": 1, "non_null_value_sum": 7,  "exceeds_threshold": false},
+     "before_snapshot_id": "batch-correction-before-…",
+     "after_snapshot_id":  "batch-correction-after-…"},
+    {"batch": "B", "role": "new",
+     "before": {"sample_count": 2, "non_null_value_sum": 5,  "exceeds_threshold": false},
+     "after":  {"sample_count": 3, "non_null_value_sum": 19, "exceeds_threshold": true},
+     "before_snapshot_id": "batch-correction-before-…",
+     "after_snapshot_id":  "batch-correction-after-…"}
+  ]
+}
+```
+
+语义与失败处理：
+
+- **前后结论的来源**：`before` 取自事务开始时的固定快照；`after` 取自同一
+  事务内**更正提交后**重新读取的数据，而非按增量推算。
+- **原子性**：校验、前后统计、批次更新、两份快照归档都在同一事务内；任一步
+  失败整体回滚，不会留下半次修改或半个归档快照。
+- **竞争冲突**：若在「计算完成」到「提交」之间，**原批次或新批次**的样本/检测
+  被其他请求改动并提交，整次更正返回 `409 concurrent_modification`，不应用
+  基于过时数据的结论。**其他批次**的改动不影响本次更正（不会误报冲突）。
+- **期望批次不符**：返回 `409 batch_precondition_failed`，附带 `current_batch`。
+- **样本不存在**：返回 `404 sample_not_found`。
+- **新批次不存在**时按空批次处理（`sample_count=0`、`non_null_value_sum=0`），
+  更正会自然创建该批次。
+- 未发生实际变化的重复写入（例如把同一检测行原样 upsert）不推进批次修订号，
+  不会触发误报冲突。
+- `expected_batch == new_batch` 时视为幂等更正，只返回一条前后相同的结论。
+
+**并发检测实现**：`samples` / `results` 上的触发器维护 `batch_revision` 表，
+每次写入都会在同一事务内推进受影响批次的修订号。更正事务在可重复读下先对
+原/新两个批次修订行加锁；若这两行在本事务快照之后被其他已提交事务改写过，
+PostgreSQL 的「先更新者胜」会抛出序列化失败，接口据此返回 409。其他批次的
+修订行不参与加锁，因此不妨碍更正。
+
+**追溯更正前/后来源**：把返回的 `before_snapshot_id` / `after_snapshot_id`
+传给 `POST /query`，即可在**当时那份完整快照**上执行任意受管 SELECT，
+`rows`、`lineage`、`row_content` 均为快照当时的样子：
+
+```bash
+curl -s -X POST localhost:8000/query -H 'Content-Type: application/json' \
+  -d '{"sql": "SELECT batch, COUNT(*) c FROM samples GROUP BY batch",
+       "snapshot_id": "batch-correction-before-…"}'
+```
+
+指定不存在的 `snapshot_id` 返回 `404 snapshot_not_found`。不传 `snapshot_id`
+时仍读取当前已提交数据。
+
 ## 五、本地开发与测试（无 Docker 时）
 
 ```bash
@@ -121,14 +206,15 @@ TEST_DATABASE_DSN=$DATABASE_ADMIN_DSN pytest -q
 ```
 app/
   config.py         环境配置
-  db.py             连接、快照事务、临时溯源函数、数据维护
+  errors.py         批次更正的可预期失败（404/409）
+  db.py             连接、快照事务与归档、批次修订触发器、更正事务、数据维护
   sql_validate.py   SQL 白名单与语义校验
   sql_rewrite.py    AST 改写：快照替换 + jsonb 溯源传播
-  service.py        校验→快照→改写→执行→回填源行内容
+  service.py        校验→快照→改写→执行→回填源行内容；批次更正结论
   main.py           FastAPI 路由
   seed.py           预置数据
 scripts/            建库播种与冒烟脚本
-tests/              校验器单元测试 + HTTP/溯源端到端测试
-examples/           五类示例说明
+tests/              校验器单元测试 + HTTP/溯源/批次更正（含竞争）端到端测试
+examples/           示例说明
 docker-compose.yml  db + api 一键启动
 ```

@@ -24,12 +24,13 @@ services:
     environment:
       DATABASE_ADMIN_DSN: postgresql://app:app@db:5432/lineage
       DATABASE_QUERY_DSN: postgresql://app:app@db:5432/lineage
-    # 启动前幂等建表+播种（已存在数据时整表重置为预置演示数据）
+    # 启动前幂等建表+播种（samples 非空时跳过，容器重启不覆盖已提交更正）
     command: >
       sh -c "python -m scripts.seed_db &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 5s

@@ -1,4 +1,4 @@
-"""FastAPI 应用：查询溯源、数据维护、表内容查看与健康检查。"""
+"""FastAPI 应用：查询溯源、批次更正、数据维护、表内容查看与健康检查。"""
 from __future__ import annotations
 
 from typing import Any
@@ -9,7 +9,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from . import db
-from .service import QueryFailure, run_lineage_query
+from .errors import (
+    BatchPreconditionFailed,
+    ConcurrentModification,
+    SampleNotFound,
+    SnapshotNotFound,
+)
+from .service import QueryFailure, correct_batch, run_lineage_query
 from .sql_validate import TABLE_SCHEMA, UnsupportedSQLError
 
 
@@ -21,13 +27,16 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="异常汇总溯源 API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "提交受管 SELECT，返回原结果以及每一行由哪些源样本/检测行构成"
         "（含源行 ID、快照当时内容与出现次数）。支持 INNER/LEFT 等值连接、"
         "WHERE、GROUP BY、HAVING、COUNT/SUM 与一个先聚合的非递归 CTE，"
-        "其他语法一律拒绝。所有依据固定在同一已提交快照上。"
+        "其他语法一律拒绝。所有依据固定在同一已提交快照上。\n\n"
+        "另提供批次更正接口：原子地移动样本批次并返回受影响批次更正前后"
+        "的样本数、非空检测值总和与是否超阈；并发改动原/新批次时整次冲突"
+        "回滚。"
     ),
 )
 
@@ -37,6 +46,13 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 class QueryRequest(BaseModel):
     sql: str = Field(..., description="受管 SELECT 语句")
+    snapshot_id: str | None = Field(
+        default=None,
+        description=(
+            "可选：批次更正返回的 before/after 快照 ID。"
+            "指定后在该历史快照上执行查询，用于追溯更正前或更正后的完整来源。"
+        ),
+    )
 
 
 class SourceItem(BaseModel):
@@ -75,6 +91,44 @@ class IdIn(BaseModel):
     id: int = Field(..., ge=0)
 
 
+class BatchCorrectionIn(BaseModel):
+    sample_id: int = Field(..., ge=0, description="要更正的样本 ID")
+    expected_batch: str = Field(
+        ..., min_length=1, max_length=100, description="调用方期望的旧批次"
+    )
+    new_batch: str = Field(
+        ..., min_length=1, max_length=100, description="更正后的新批次"
+    )
+    threshold: float | int = Field(
+        ...,
+        description="异常阈值：非空检测值总和严格大于该值即视为超阈",
+    )
+
+
+class BatchSummary(BaseModel):
+    sample_count: int
+    non_null_value_sum: float | int
+    exceeds_threshold: bool
+
+
+class BatchEffect(BaseModel):
+    batch: str
+    role: str = Field(..., description="old=原批次；new=新批次")
+    before: BatchSummary = Field(..., description="更正前快照上的结论")
+    after: BatchSummary = Field(..., description="成功提交后的结论")
+    before_snapshot_id: str
+    after_snapshot_id: str
+
+
+class BatchCorrectionResponse(BaseModel):
+    sample_id: int
+    expected_batch: str
+    new_batch: str
+    threshold: float | int
+    applied: bool
+    batches: list[BatchEffect]
+
+
 # --------------------------------------------------------------------------- #
 # 启动
 # --------------------------------------------------------------------------- #
@@ -95,11 +149,16 @@ def health() -> dict[str, str]:
 )
 def query(payload: QueryRequest) -> QueryResponse:
     try:
-        result = run_lineage_query(payload.sql)
+        result = run_lineage_query(payload.sql, payload.snapshot_id)
     except UnsupportedSQLError as exc:
         raise HTTPException(
             status_code=400,
             detail={"error": "unsupported_sql", "message": str(exc)},
+        )
+    except SnapshotNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "snapshot_not_found", "message": str(exc)},
         )
     except QueryFailure as exc:
         # 执行失败：事务已回滚，不返回部分依据
@@ -118,6 +177,65 @@ def query(payload: QueryRequest) -> QueryResponse:
             detail={"error": "internal_error", "message": "查询处理失败，未返回任何依据"},
         ) from exc
     return QueryResponse(**result)
+
+
+# --------------------------------------------------------------------------- #
+# 批次更正（原子操作 + 乐观并发冲突检测）
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/batch-corrections",
+    response_model=BatchCorrectionResponse,
+    tags=["批次更正"],
+    summary="更正样本批次并返回受影响批次更正前后的异常汇总",
+    responses={
+        404: {"description": "样本不存在"},
+        409: {"description": "期望旧批次不符，或原/新批次被并发改动"},
+    },
+)
+def correct_sample_batch(
+    payload: BatchCorrectionIn,
+) -> BatchCorrectionResponse:
+    try:
+        result = correct_batch(
+            sample_id=payload.sample_id,
+            expected_batch=payload.expected_batch,
+            new_batch=payload.new_batch,
+            threshold=payload.threshold,
+        )
+    except SampleNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "sample_not_found", "message": str(exc)},
+        )
+    except BatchPreconditionFailed as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "batch_precondition_failed",
+                "message": str(exc),
+                "expected_batch": exc.expected,
+                "current_batch": exc.current,
+            },
+        )
+    except ConcurrentModification as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "concurrent_modification",
+                "message": str(exc),
+                "batch": exc.batch,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - 兜底：整次回滚，不留半次修改
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "批次更正失败，未应用任何修改",
+            },
+        ) from exc
+    return BatchCorrectionResponse(**result)
+
 
 
 # --------------------------------------------------------------------------- #

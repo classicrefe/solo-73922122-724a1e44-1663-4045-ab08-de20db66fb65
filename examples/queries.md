@@ -107,3 +107,45 @@ curl -s localhost:8000/tables/samples
 ```
 
 任何进行中的查询都固定在自己提交时的快照，变更只影响之后的新请求。
+
+## 批次更正：更正前后异常汇总会怎样变化
+
+以预置数据为例，把样本 1 从批次 A 更正到批次 B，阈值 10：
+
+```bash
+curl -s -X POST localhost:8000/batch-corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_id": 1, "expected_batch": "A", "new_batch": "B", "threshold": 10}'
+```
+
+预期：
+
+| 批次 | 更正前样本数 | 更正前非空总和 | 更正前超阈 | 更正后样本数 | 更正后非空总和 | 更正后超阈 |
+| --- | --- | --- | --- | --- | --- | --- |
+| A（原） | 2 | 21 | 是 | 1 | 7 | 否 |
+| B（新） | 2 | 5  | 否 | 3 | 19 | 是 |
+
+响应里的 `before_snapshot_id` / `after_snapshot_id` 可用于追溯：
+
+```bash
+# 更正前：样本 1 仍属于 A
+curl -s -X POST localhost:8000/query -H 'Content-Type: application/json' \
+  -d '{"sql": "SELECT id, batch FROM samples WHERE id = 1",
+       "snapshot_id": "<before_snapshot_id>"}'
+# 更正后：样本 1 已属于 B（连同 row_content 都是当时的行内容）
+curl -s -X POST localhost:8000/query -H 'Content-Type: application/json' \
+  -d '{"sql": "SELECT id, batch FROM samples WHERE id = 1",
+       "snapshot_id": "<after_snapshot_id>"}'
+```
+
+冲突场景：若两次并发更正以同一个 `expected_batch` 竞争，或更正过程中有人改动
+了原/新批次的样本、检测，后到的请求返回 `409`，且数据不会只改一半：
+
+```bash
+# 第一次成功
+curl -s -X POST localhost:8000/batch-corrections -H 'Content-Type: application/json' \
+  -d '{"sample_id": 1, "expected_batch": "A", "new_batch": "B", "threshold": 10}'
+# 第二次仍以旧批次 A 为前提 -> 409 batch_precondition_failed
+curl -s -X POST localhost:8000/batch-corrections -H 'Content-Type: application/json' \
+  -d '{"sample_id": 1, "expected_batch": "A", "new_batch": "C", "threshold": 10}'
+```
